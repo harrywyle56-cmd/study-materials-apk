@@ -73,6 +73,89 @@ jobs:
       - name: Initialize Android project
         run: pnpm tauri android init --ci
 
+      - name: Configure Android release signing
+        env:
+          ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ANDROID_KEY_BASE64" ] || [ -z "$ANDROID_KEY_ALIAS" ] || [ -z "$ANDROID_KEY_PASSWORD" ]; then
+            echo "::error::Set the ANDROID_KEY_BASE64, ANDROID_KEY_ALIAS, and ANDROID_KEY_PASSWORD GitHub Actions secrets before building."
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/android-signing"
+          printf '%s' "$ANDROID_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/android-signing/release.jks"
+          test -s "$RUNNER_TEMP/android-signing/release.jks"
+
+          cd src-tauri/gen/android
+          {
+            printf 'keyAlias=%s\\n' "$ANDROID_KEY_ALIAS"
+            printf 'password=%s\\n' "$ANDROID_KEY_PASSWORD"
+            printf 'storeFile=%s\\n' "$RUNNER_TEMP/android-signing/release.jks"
+          } > keystore.properties
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("app/build.gradle.kts")
+          text = path.read_text()
+          if "signingConfigs" in text and 'getByName("release")' in text and 'signingConfig = signingConfigs.getByName("release")' in text:
+              print("Release signing is already configured.")
+              raise SystemExit(0)
+
+          imports = []
+          if "import java.io.FileInputStream" not in text:
+              imports.append("import java.io.FileInputStream")
+          if "import java.util.Properties" not in text:
+              imports.append("import java.util.Properties")
+          if imports:
+              text = "\\n".join(imports) + "\\n" + text
+
+          match = re.search(r"(?m)^android\\s*\\{", text)
+          if not match:
+              raise SystemExit("Could not find android { } block in app/build.gradle.kts")
+
+          start = text.find("{", match.start())
+          depth = 0
+          end = None
+          for i in range(start, len(text)):
+              if text[i] == "{":
+                  depth += 1
+              elif text[i] == "}":
+                  depth -= 1
+                  if depth == 0:
+                      end = i
+                      break
+          if end is None:
+              raise SystemExit("Could not locate the end of the android block")
+
+          signing = '''
+              signingConfigs {
+                  create("release") {
+                      val propsFile = rootProject.file("keystore.properties")
+                      val props = Properties()
+                      props.load(FileInputStream(propsFile))
+                      keyAlias = props["keyAlias"] as String
+                      keyPassword = props["password"] as String
+                      storeFile = file(props["storeFile"] as String)
+                      storePassword = props["password"] as String
+                  }
+              }
+
+              buildTypes {
+                  getByName("release") {
+                      signingConfig = signingConfigs.getByName("release")
+                  }
+              }
+          '''
+          text = text[:end] + signing + "\\n" + text[end:]
+          path.write_text(text)
+          print("Configured release APK signing.")
+          PY
+
       - name: Build APKs
         run: pnpm tauri android build --apk --split-per-abi --target aarch64 armv7 x86_64
 
