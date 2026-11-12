@@ -1,0 +1,96 @@
+name: Build Android APK
+
+on:
+  push:
+    paths:
+      - 'study-materials-fork-main-audited(1).zip'
+      - '.github/workflows/build-apk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract supplied source archive
+        run: |
+          set -euo pipefail
+          ARCHIVE='study-materials-fork-main-audited(1).zip'
+          if [ ! -f "$ARCHIVE" ]; then
+            echo "::error::Upload $ARCHIVE to the repository root first."
+            exit 1
+          fi
+          unzip -q "$ARCHIVE" -d extracted
+          ROOT="$(find extracted -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+          if [ -z "$ROOT" ] || [ ! -f "$ROOT/package.json" ] || [ ! -d "$ROOT/src-tauri" ]; then
+            echo "::error::Archive layout is not the expected Tauri project."
+            exit 1
+          fi
+          cp -a "$ROOT/." .
+          rm -rf extracted
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prepare Android SDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          "$SDKM" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Initialize Android project
+        run: pnpm tauri android init --ci
+
+      - name: Build APKs
+        run: pnpm tauri android build --apk --split-per-abi --target aarch64 armv7 x86_64
+
+      - name: Collect APK files
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' -exec cp {} artifacts/ \;
+          if ! compgen -G 'artifacts/*.apk' >/dev/null; then
+            echo "::error::No APK files were generated."
+            exit 1
+          fi
+          ls -lh artifacts
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apks
+          path: artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 14
